@@ -1,0 +1,898 @@
+"""
+LED WALL LEAD MACHINE
+A VS Code-ready Streamlit app for finding LED wall sales leads, storing them in SQLite,
+generating cold call scripts/emails, and tracking outreach in real time.
+
+WHAT IT DOES
+- Searches Google Places for prospects in target cities/categories
+- Stores leads in a local SQLite CRM database
+- Generates LED-wall-specific cold call scripts and outreach emails
+- Lets you update lead status, notes, priority, and follow-up date
+- Exports leads to CSV
+- Provides a real-time Streamlit dashboard
+
+WHAT IT DOES NOT DO BY DEFAULT
+- It does not mass-call people automatically
+- It does not mass-email people automatically
+- It does not scrape private/personal data
+
+SETUP
+1. Create a folder in VS Code, e.g. led-lead-machine
+2. Save this file as: led_wall_lead_machine.py
+3. Create a .env file in the same folder with:
+
+   GOOGLE_MAPS_API_KEY=your_google_places_api_key_here
+   SALES_EMAIL=citysaleslive@gmail.com
+   SMTP_SERVER=smtp.gmail.com
+   SMTP_PORT=587
+   SMTP_PASSWORD=your_gmail_app_password_here
+
+4. Install dependencies:
+
+   pip install streamlit requests python-dotenv pandas
+
+5. Run:
+
+   streamlit run led_wall_lead_machine.py
+
+NOTE: For Gmail, enable 2FA and generate an app-specific password at https://myaccount.google.com/apppasswords
+
+NOTES
+- You need Google Places API enabled in Google Cloud.
+- Cold outreach must comply with CAN-SPAM, TCPA, DNC rules, platform policies, and local law.
+- Use this to build qualified business leads and outreach drafts, not spam.
+"""
+
+import os
+import sqlite3
+import smtplib
+import time
+import urllib.parse
+from datetime import date, datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import Dict, List, Optional
+
+import pandas as pd
+import requests
+import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+SALES_EMAIL = os.getenv("SALES_EMAIL", "citysaleslive@gmail.com")
+SALES_NAME = os.getenv("SALES_NAME", "Austin")
+SALES_PHONE = os.getenv("SALES_PHONE", "")
+SALES_WEBSITE = os.getenv("SALES_WEBSITE", "https://p3avl.com/")
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+DB_PATH = "led_wall_leads.db"
+
+TARGET_CITIES = [
+    "Houston, TX",
+    "Austin, TX",
+    "San Antonio, TX",
+    "Oklahoma City, OK",
+    "Tulsa, OK",
+    "Dallas, TX",
+    "Fort Worth, TX",
+]
+
+DEFAULT_SEARCH_TERMS = [
+    "sports bar with patio",
+    "live music venue",
+    "outdoor event venue",
+    "corporate event venue",
+    "wedding venue outdoor",
+    "brewery with outdoor stage",
+    "rooftop bar",
+    "nightclub",
+    "church production",
+    "event planner",
+    "AV rental company",
+    "audio visual company",
+    "festival organizer",
+    "shopping center events",
+    "hotel event venue",
+    "private event venue",
+    "food truck park",
+    "entertainment venue",
+]
+
+SEGMENT_MAPPING = {
+    "sports bar": "Sports Bar / Patio Bar",
+    "bar": "Bar / Nightlife",
+    "brewery": "Brewery / Outdoor Venue",
+    "live music": "Live Music Venue",
+    "music venue": "Live Music Venue",
+    "event venue": "Event Venue",
+    "wedding venue": "Wedding / Event Venue",
+    "church": "Church / Worship Production",
+    "AV": "AV / Production Company",
+    "audio visual": "AV / Production Company",
+    "festival": "Festival / Public Event",
+    "hotel": "Hotel / Hospitality Events",
+    "shopping center": "Commercial Property / Retail Center",
+    "nightclub": "Nightclub / Entertainment",
+    "food truck": "Food Truck Park / Outdoor Gathering Space",
+}
+
+STATUS_OPTIONS = [
+    "New",
+    "Contacted",
+    "Interested",
+    "Needs Follow-Up",
+    "Site Walk Requested",
+    "Quoted",
+    "Negotiating",
+    "Won",
+    "Lost",
+    "Do Not Contact",
+]
+
+PRIORITY_OPTIONS = ["Hot", "Warm", "Cold", "Unqualified"]
+
+
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            place_id TEXT UNIQUE,
+            business_name TEXT,
+            segment TEXT,
+            city TEXT,
+            address TEXT,
+            phone TEXT,
+            website TEXT,
+            google_maps_url TEXT,
+            rating REAL,
+            user_ratings_total INTEGER,
+            status TEXT DEFAULT 'New',
+            priority TEXT DEFAULT 'Warm',
+            contact_name TEXT,
+            contact_title TEXT,
+            contact_email TEXT,
+            notes TEXT,
+            last_contacted TEXT,
+            follow_up_date TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def infer_segment(search_term: str, business_name: str = "") -> str:
+    combined = f"{search_term} {business_name}".lower()
+    for key, segment in SEGMENT_MAPPING.items():
+        if key.lower() in combined:
+            return segment
+    return "General Venue / Business"
+
+
+def google_places_text_search(query: str) -> List[Dict]:
+    """Search Google Places Text Search API."""
+    if not GOOGLE_MAPS_API_KEY:
+        st.error("Missing GOOGLE_MAPS_API_KEY in .env file.")
+        return []
+
+    endpoint = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {
+        "query": query,
+        "key": GOOGLE_MAPS_API_KEY,
+    }
+
+    all_results = []
+    next_page_token = None
+
+    for page in range(3):
+        if next_page_token:
+            # Google requires a short delay before next_page_token becomes valid.
+            time.sleep(2)
+            params = {
+                "pagetoken": next_page_token,
+                "key": GOOGLE_MAPS_API_KEY,
+            }
+
+        resp = requests.get(endpoint, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        status = data.get("status")
+        if status not in ["OK", "ZERO_RESULTS"]:
+            st.warning(f"Google Places returned status: {status} - {data.get('error_message', '')}")
+            break
+
+        results = data.get("results", [])
+        all_results.extend(results)
+        next_page_token = data.get("next_page_token")
+
+        if not next_page_token:
+            break
+
+    return all_results
+
+
+def google_place_details(place_id: str) -> Dict:
+    """Fetch phone, website, address, and Maps URL."""
+    if not GOOGLE_MAPS_API_KEY:
+        return {}
+
+    endpoint = "https://maps.googleapis.com/maps/api/place/details/json"
+    fields = ",".join([
+        "place_id",
+        "name",
+        "formatted_address",
+        "formatted_phone_number",
+        "website",
+        "url",
+        "rating",
+        "user_ratings_total",
+    ])
+    params = {
+        "place_id": place_id,
+        "fields": fields,
+        "key": GOOGLE_MAPS_API_KEY,
+    }
+    resp = requests.get(endpoint, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("result", {})
+
+
+def upsert_lead(lead: Dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+
+    cur.execute(
+        """
+        INSERT INTO leads (
+            place_id, business_name, segment, city, address, phone, website,
+            google_maps_url, rating, user_ratings_total, status, priority,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(place_id) DO UPDATE SET
+            business_name=excluded.business_name,
+            segment=excluded.segment,
+            city=excluded.city,
+            address=excluded.address,
+            phone=excluded.phone,
+            website=excluded.website,
+            google_maps_url=excluded.google_maps_url,
+            rating=excluded.rating,
+            user_ratings_total=excluded.user_ratings_total,
+            updated_at=excluded.updated_at
+        """,
+        (
+            lead.get("place_id"),
+            lead.get("business_name"),
+            lead.get("segment"),
+            lead.get("city"),
+            lead.get("address"),
+            lead.get("phone"),
+            lead.get("website"),
+            lead.get("google_maps_url"),
+            lead.get("rating"),
+            lead.get("user_ratings_total"),
+            lead.get("status", "New"),
+            lead.get("priority", "Warm"),
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_leads(where_clause: str = "", params: tuple = ()) -> pd.DataFrame:
+    conn = get_conn()
+    query = "SELECT * FROM leads"
+    if where_clause:
+        query += f" WHERE {where_clause}"
+    query += " ORDER BY updated_at DESC"
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+
+def update_lead_field(lead_id: int, updates: Dict):
+    if not updates:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+    values = list(updates.values()) + [lead_id]
+    cur.execute(f"UPDATE leads SET {set_clause} WHERE id = ?", values)
+    conn.commit()
+    conn.close()
+
+
+def generate_email(lead: Dict) -> str:
+    name = lead.get("business_name") or "your venue"
+    city = lead.get("city") or "your market"
+    segment = lead.get("segment") or "venue"
+
+    return f"""Subject: Outdoor LED wall options for {name}
+
+My name is {SALES_NAME}. I'm with P³AVL, a full-service AVL production company specializing in LED walls, audio systems, lighting design, staging, lasers, and special effects.
+
+We currently have Downtown Dallas LED wall projects lined up at Bar W, Klyde Warren Park, and Plaza of the Americas, and I’m now opening availability for {city}.
+
+There are three ways we can structure it:
+
+1. Permanent LED wall install
+2. Monthly / seasonal LED wall rental
+3. Event-based rental for concerts, sports, festivals, and private events
+
+For a {segment.lower()}, the strongest use case is usually turning the screen into a revenue asset: more event bookings, better game-day traffic, sponsor ad inventory, and a premium visual experience.
+
+Would you be the right person to talk with about AV upgrades or event production at {name}?
+
+{SALES_NAME}
+{SALES_PHONE}
+{SALES_EMAIL}
+{SALES_WEBSITE}
+P³AVL - Zero Friction. Full Impact.
+DFW / Texas / Oklahoma LED Wall Sales & Rentals
+"""
+
+
+def generate_call_script(lead: Dict) -> str:
+    name = lead.get("business_name") or "your venue"
+    city = lead.get("city") or "your market"
+    segment = lead.get("segment") or "venue"
+
+    return f"""CALL SCRIPT — {name}
+
+OPENING:
+Hey, this is {SALES_NAME} from P³AVL. I know this is a cold call, but I'll be quick.
+
+I have a large shipment of outdoor-rated P3.9 LED video wall panels from our professional lineup (AETHER, VEGA, APEX, PHOTON, NOVA, QUASAR, VERTEX, HORIZON, SPECTRA, HELIX, HALO, FLARE) landing in DFW, and I'm lining up venues and event spaces in {city} for installs, long-term rentals, and event rentals.
+
+The reason I’m calling {name} specifically is that it looks like a strong fit for a screen setup — especially for sports watch parties, outdoor events, concerts, private events, sponsor ads, or premium visual experiences.
+
+QUALIFYING QUESTION:
+Who handles AV, event production, venue upgrades, or private event decisions for you all?
+
+IF THEY ASK WHAT IT IS:
+It’s a modular outdoor LED video wall — bright enough for outdoor use and built for patios, stages, parks, plazas, sports events, and live entertainment. It’s not a projector. It’s the kind of wall you’d see behind a stage or at a major watch party.
+
+IF THEY SOUND INTERESTED:
+We have three options: permanent install, monthly rental, or event-based rental. For a {segment.lower()}, I’d probably look first at whether this could help drive more event revenue or sponsorship revenue.
+
+CLOSE FOR NEXT STEP:
+Would it make sense for me to send you a few wall-size examples and rough pricing? Or would a 10-minute call/site walk be better?
+
+VOICEMAIL:
+Hey, this is {SALES_NAME} from P³AVL. I'm reaching out because we have outdoor-rated P3.9 LED video wall inventory from our professional lineup landing in DFW and we're booking venues in {city} for installs, monthly rentals, and event rentals. I thought {name} could be a strong fit for sports events, private events, sponsor ads, or outdoor entertainment. My number is {SALES_PHONE}. Again, {SALES_NAME} at {SALES_PHONE}.
+"""
+
+
+def generate_sms(lead: Dict) -> str:
+    name = lead.get("business_name") or "your venue"
+    city = lead.get("city") or "your market"
+    return f"Hey, this is {SALES_NAME} from P³AVL. I have outdoor-rated P3.9 LED video wall inventory from our professional lineup landing in DFW and I'm lining up venues in {city} for installs, long-term rentals, and event rentals. I thought {name} could be a strong fit. Who handles AV/event upgrades for you all?"
+
+
+def mailto_link(email: str, subject: str, body: str) -> str:
+    return "mailto:" + urllib.parse.quote(email) + "?subject=" + urllib.parse.quote(subject) + "&body=" + urllib.parse.quote(body)
+
+
+def click_to_call_link(phone: str) -> str:
+    cleaned = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
+    return f"tel:{cleaned}"
+
+
+def send_email(recipient_email: str, subject: str, body: str) -> tuple[bool, str]:
+    """Send email via SMTP. Returns (success: bool, message: str)."""
+    if not SMTP_PASSWORD or not SALES_EMAIL:
+        return False, "SMTP_PASSWORD or SALES_EMAIL not configured in .env file."
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = SALES_EMAIL
+        msg["To"] = recipient_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SALES_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True, f"Email sent successfully to {recipient_email}."
+    except Exception as e:
+        return False, f"Failed to send email: {str(e)}"
+
+
+def prospect_search_ui():
+    st.subheader("1. Generate New Leads")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        selected_cities = st.multiselect("Target cities", TARGET_CITIES, default=["Houston, TX", "Austin, TX", "San Antonio, TX", "Oklahoma City, OK", "Tulsa, OK"])
+    with col2:
+        selected_terms = st.multiselect("Search categories", DEFAULT_SEARCH_TERMS, default=["sports bar with patio", "live music venue", "outdoor event venue", "AV rental company"])
+
+    custom_terms = st.text_area(
+        "Optional custom search terms, one per line",
+        placeholder="Example:\nWorld Cup watch party venue\nlarge patio bar\noutdoor concert venue",
+    )
+
+    if custom_terms.strip():
+        selected_terms += [t.strip() for t in custom_terms.splitlines() if t.strip()]
+
+    max_details = st.slider("Max detailed leads to import per search batch", 10, 300, 60)
+
+    if st.button("Search & Import Leads", type="primary"):
+        if not selected_cities or not selected_terms:
+            st.warning("Select at least one city and one search category.")
+            return
+
+        imported = 0
+        seen_place_ids = set()
+        progress = st.progress(0)
+        total_queries = len(selected_cities) * len(selected_terms)
+        query_count = 0
+
+        with st.status("Searching Google Places and importing leads...", expanded=True) as status:
+            for city in selected_cities:
+                for term in selected_terms:
+                    query_count += 1
+                    progress.progress(query_count / total_queries)
+                    search_query = f"{term} in {city}"
+                    st.write(f"Searching: {search_query}")
+
+                    try:
+                        results = google_places_text_search(search_query)
+                    except Exception as e:
+                        st.error(f"Search failed for {search_query}: {e}")
+                        continue
+
+                    for result in results:
+                        if imported >= max_details:
+                            break
+
+                        place_id = result.get("place_id")
+                        if not place_id or place_id in seen_place_ids:
+                            continue
+                        seen_place_ids.add(place_id)
+
+                        try:
+                            details = google_place_details(place_id)
+                        except Exception as e:
+                            st.warning(f"Could not fetch details for {result.get('name')}: {e}")
+                            details = result
+
+                        business_name = details.get("name") or result.get("name")
+                        segment = infer_segment(term, business_name)
+
+                        lead = {
+                            "place_id": place_id,
+                            "business_name": business_name,
+                            "segment": segment,
+                            "city": city,
+                            "address": details.get("formatted_address") or result.get("formatted_address"),
+                            "phone": details.get("formatted_phone_number"),
+                            "website": details.get("website"),
+                            "google_maps_url": details.get("url"),
+                            "rating": details.get("rating") or result.get("rating"),
+                            "user_ratings_total": details.get("user_ratings_total") or result.get("user_ratings_total"),
+                            "status": "New",
+                            "priority": "Warm",
+                        }
+                        upsert_lead(lead)
+                        imported += 1
+
+                    if imported >= max_details:
+                        break
+                if imported >= max_details:
+                    break
+
+            status.update(label=f"Imported/updated {imported} leads.", state="complete")
+
+
+def dashboard_ui():
+    st.subheader("2. Live Sales Dashboard")
+    df = fetch_leads()
+
+    if df.empty:
+        st.info("No leads yet. Use the lead generator first.")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Leads", len(df))
+    col2.metric("Hot Leads", int((df["priority"] == "Hot").sum()))
+    col3.metric("Interested", int((df["status"] == "Interested").sum()))
+    col4.metric("Quoted", int((df["status"] == "Quoted").sum()))
+
+    st.write("### Pipeline by Status")
+    status_counts = df["status"].fillna("New").value_counts().reset_index()
+    status_counts.columns = ["Status", "Count"]
+    st.bar_chart(status_counts.set_index("Status"))
+
+    st.write("### Leads by City")
+    city_counts = df["city"].fillna("Unknown").value_counts().reset_index()
+    city_counts.columns = ["City", "Count"]
+    st.bar_chart(city_counts.set_index("City"))
+
+    st.write("### CRM Table")
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    with filter_col1:
+        city_filter = st.multiselect("Filter by city", sorted(df["city"].dropna().unique().tolist()))
+    with filter_col2:
+        status_filter = st.multiselect("Filter by status", STATUS_OPTIONS)
+    with filter_col3:
+        priority_filter = st.multiselect("Filter by priority", PRIORITY_OPTIONS)
+
+    filtered = df.copy()
+    if city_filter:
+        filtered = filtered[filtered["city"].isin(city_filter)]
+    if status_filter:
+        filtered = filtered[filtered["status"].isin(status_filter)]
+    if priority_filter:
+        filtered = filtered[filtered["priority"].isin(priority_filter)]
+
+    st.dataframe(
+        filtered[[
+            "id",
+            "business_name",
+            "segment",
+            "city",
+            "phone",
+            "website",
+            "rating",
+            "status",
+            "priority",
+            "follow_up_date",
+            "notes",
+        ]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    csv = filtered.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Export Filtered Leads to CSV",
+        data=csv,
+        file_name=f"led_wall_leads_{date.today().isoformat()}.csv",
+        mime="text/csv",
+    )
+
+
+def lead_workbench_ui():
+    st.subheader("3. Lead Workbench: Call, Email, Update")
+    df = fetch_leads()
+
+    if df.empty:
+        st.info("No leads available yet.")
+        return
+
+    search = st.text_input("Search lead by business name, city, segment, phone, or notes")
+    work_df = df.copy()
+    if search.strip():
+        s = search.lower()
+        work_df = work_df[
+            work_df.apply(lambda row: s in " ".join([str(x).lower() for x in row.values]), axis=1)
+        ]
+
+    if work_df.empty:
+        st.warning("No matching leads.")
+        return
+
+    lead_labels = [
+        f"#{int(row.id)} | {row.business_name} | {row.city} | {row.status} | {row.priority}"
+        for _, row in work_df.iterrows()
+    ]
+    selected_label = st.selectbox("Select lead", lead_labels)
+    selected_id = int(selected_label.split("|")[0].replace("#", "").strip())
+    lead_row = df[df["id"] == selected_id].iloc[0].to_dict()
+
+    st.write(f"### {lead_row.get('business_name')}")
+    st.write(f"**Segment:** {lead_row.get('segment')}")
+    st.write(f"**City:** {lead_row.get('city')}")
+    st.write(f"**Address:** {lead_row.get('address')}")
+    st.write(f"**Phone:** {lead_row.get('phone') or 'Not found'}")
+    st.write(f"**Website:** {lead_row.get('website') or 'Not found'}")
+    st.write(f"**Google Maps:** {lead_row.get('google_maps_url') or 'Not found'}")
+
+    if lead_row.get("phone"):
+        st.markdown(f"[Click to call]({click_to_call_link(lead_row['phone'])})")
+
+    tab1, tab2, tab3, tab4 = st.tabs(["Call Script", "Email", "SMS", "Update CRM"])
+
+    with tab1:
+        st.text_area("Cold Call Script", generate_call_script(lead_row), height=440)
+
+    with tab2:
+        email_text = generate_email(lead_row)
+        email_body = "\n".join(email_text.splitlines()[2:])
+        edited_email = st.text_area("Cold Email Draft", email_body, height=380, key="email_draft")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if lead_row.get("contact_email"):
+                subject = email_text.splitlines()[0].replace("Subject:", "").strip()
+                st.markdown(f"[📧 Open in Email Client]({mailto_link(lead_row['contact_email'], subject, edited_email)})")
+            else:
+                st.info("Add a contact email in the CRM update tab to enable email drafting.")
+        
+        with col2:
+            if lead_row.get("contact_email") and SMTP_PASSWORD:
+                if st.button("📤 Send Email Now", key=f"send_email_{selected_id}"):
+                    subject = email_text.splitlines()[0].replace("Subject:", "").strip()
+                    success, message = send_email(lead_row["contact_email"], subject, edited_email)
+                    if success:
+                        st.success(message)
+                        update_lead_field(selected_id, {"last_contacted": datetime.utcnow().isoformat()})
+                    else:
+                        st.error(message)
+
+    with tab3:
+        st.text_area("SMS / LinkedIn DM Draft", generate_sms(lead_row), height=180)
+
+    with tab4:
+        with st.form("update_lead_form"):
+            contact_name = st.text_input("Contact name", value=lead_row.get("contact_name") or "")
+            contact_title = st.text_input("Contact title", value=lead_row.get("contact_title") or "")
+            contact_email = st.text_input("Contact email", value=lead_row.get("contact_email") or "")
+            status = st.selectbox("Status", STATUS_OPTIONS, index=STATUS_OPTIONS.index(lead_row.get("status") if lead_row.get("status") in STATUS_OPTIONS else "New"))
+            priority = st.selectbox("Priority", PRIORITY_OPTIONS, index=PRIORITY_OPTIONS.index(lead_row.get("priority") if lead_row.get("priority") in PRIORITY_OPTIONS else "Warm"))
+            follow_up = st.date_input(
+                "Follow-up date",
+                value=datetime.strptime(lead_row["follow_up_date"], "%Y-%m-%d").date() if lead_row.get("follow_up_date") else date.today() + timedelta(days=2),
+            )
+            notes = st.text_area("Notes", value=lead_row.get("notes") or "", height=180)
+            mark_contacted = st.checkbox("Mark as contacted now")
+
+            submitted = st.form_submit_button("Save Lead Updates", type="primary")
+            if submitted:
+                updates = {
+                    "contact_name": contact_name,
+                    "contact_title": contact_title,
+                    "contact_email": contact_email,
+                    "status": status,
+                    "priority": priority,
+                    "follow_up_date": follow_up.isoformat(),
+                    "notes": notes,
+                }
+                if mark_contacted:
+                    updates["last_contacted"] = datetime.utcnow().isoformat()
+                update_lead_field(selected_id, updates)
+                st.success("Lead updated. Refreshing...")
+                time.sleep(0.5)
+                st.rerun()
+
+
+def follow_up_ui():
+    st.subheader("4. Follow-Up Queue")
+    today = date.today().isoformat()
+    df = fetch_leads("follow_up_date <= ? AND status NOT IN (?, ?)", (today, "Won", "Do Not Contact"))
+
+    if df.empty:
+        st.success("No follow-ups due today.")
+        return
+
+    st.write(f"You have {len(df)} follow-ups due today or overdue.")
+    for _, row in df.iterrows():
+        with st.expander(f"{row['business_name']} | {row['city']} | {row['status']} | Due: {row['follow_up_date']}"):
+            st.write(f"**Phone:** {row.get('phone') or 'Not found'}")
+            st.write(f"**Website:** {row.get('website') or 'Not found'}")
+            st.write(f"**Notes:** {row.get('notes') or ''}")
+            st.text_area("Follow-up call opener", generate_call_script(row.to_dict()), height=250, key=f"follow_call_{row['id']}")
+
+
+def manual_add_ui():
+    st.subheader("5. Manually Add a Lead")
+    with st.form("manual_add"):
+        business_name = st.text_input("Business name")
+        segment = st.selectbox("Segment", sorted(set(SEGMENT_MAPPING.values())) + ["General Venue / Business"])
+        city = st.text_input("City", value="DFW, TX")
+        address = st.text_input("Address")
+        phone = st.text_input("Phone")
+        website = st.text_input("Website")
+        contact_name = st.text_input("Contact name")
+        contact_title = st.text_input("Contact title")
+        contact_email = st.text_input("Contact email")
+        priority = st.selectbox("Priority", PRIORITY_OPTIONS, index=1)
+        notes = st.text_area("Notes")
+        submitted = st.form_submit_button("Add Lead", type="primary")
+
+        if submitted:
+            if not business_name:
+                st.warning("Business name is required.")
+                return
+            manual_place_id = f"manual_{business_name}_{city}_{datetime.utcnow().timestamp()}"
+            lead = {
+                "place_id": manual_place_id,
+                "business_name": business_name,
+                "segment": segment,
+                "city": city,
+                "address": address,
+                "phone": phone,
+                "website": website,
+                "google_maps_url": "",
+                "rating": None,
+                "user_ratings_total": None,
+                "status": "New",
+                "priority": priority,
+            }
+            upsert_lead(lead)
+            df = fetch_leads("place_id = ?", (manual_place_id,))
+            if not df.empty:
+                update_lead_field(
+                    int(df.iloc[0]["id"]),
+                    {
+                        "contact_name": contact_name,
+                        "contact_title": contact_title,
+                        "contact_email": contact_email,
+                        "notes": notes,
+                    },
+                )
+            st.success("Manual lead added.")
+            time.sleep(0.5)
+            st.rerun()
+
+
+def settings_ui():
+    st.subheader("Settings & Configuration")
+    
+    st.write("### Your Sales Contact Information")
+    st.info("These values are read from your .env file. Edit the .env file directly to change them.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write(f"**Name:** {SALES_NAME}")
+        st.write(f"**Email:** {SALES_EMAIL}")
+    with col2:
+        st.write(f"**Phone:** {SALES_PHONE if SALES_PHONE else '(not configured)'}")
+        st.write(f"**Website:** {SALES_WEBSITE}")
+    
+    st.divider()
+    st.write("### Email Sending Configuration")
+    
+    if SMTP_PASSWORD:
+        st.success("✅ Email sending is configured and ready to use.")
+        st.write(f"**SMTP Server:** {SMTP_SERVER}:{SMTP_PORT}")
+        st.write(f"**Sending from:** {SALES_EMAIL}")
+    else:
+        st.warning("⚠️ Email sending is not configured.")
+        st.write("To enable one-click email sending, add these to your `.env` file:")
+        st.code("""SALES_EMAIL=citysaleslive@gmail.com
+SALES_NAME=Austin
+SALES_PHONE=+1-XXX-XXX-XXXX
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+SMTP_PASSWORD=your_gmail_app_password_here
+""")
+        st.write("**For Gmail:**")
+        st.write("1. Enable 2-Factor Authentication on your Google Account")
+        st.write("2. Generate an app-specific password at: https://myaccount.google.com/apppasswords")
+        st.write("3. Paste that password as `SMTP_PASSWORD` in your `.env` file")
+    
+    st.divider()
+    st.write("### Google Places API Configuration")
+    
+    if GOOGLE_MAPS_API_KEY:
+        st.success("✅ Google Maps API key is configured.")
+    else:
+        st.warning("⚠️ Google Maps API key is not configured.")
+        st.write("Add to your `.env` file:")
+        st.code("GOOGLE_MAPS_API_KEY=your_api_key_here")
+        st.write("Get your API key: https://developers.google.com/maps/documentation/places/web-service/get-api-key")
+    
+    st.divider()
+    st.write("### Database & Cache")
+    col1, col2 = st.columns(2)
+    with col1:
+        df = fetch_leads()
+        st.metric("Total Leads in CRM", len(df))
+    with col2:
+        if st.button("🗑️ Clear All Leads (WARNING)", help="This will delete ALL leads from the database. Cannot be undone."):
+            if st.checkbox("I understand this is irreversible"):
+                conn = get_conn()
+                conn.execute("DELETE FROM leads")
+                conn.commit()
+                conn.close()
+                st.success("All leads have been deleted.")
+                st.rerun()
+
+
+def app():
+    st.set_page_config(page_title="P³AVL Lead Machine - Zero Friction. Full Impact.", layout="wide")
+    init_db()
+
+    st.title("P³AVL Lead Machine")
+    st.caption("Zero Friction. Full Impact. - Lead generation, call scripts, email drafts, CRM tracking, and live pipeline dashboard for outdoor LED wall sales.")
+
+    # Company branding section
+    with st.expander("🏢 About P³AVL", expanded=False):
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.markdown("""
+            **One production partner for LED walls, audio, lighting, staging, lasers, and more!**
+
+            P³AVL plans, deploys, and runs complete show systems so the room feels tight, the handoffs stay clean, and the audience feels the result.
+
+            **Our LED Wall Products:**
+            - **AETHER, VEGA, APEX, PHOTON, NOVA, QUASAR**
+            - **VERTEX, HORIZON, SPECTRA, HELIX, HALO, FLARE**
+            - **P0.78 Min Pitch • IP68 Max Rating • 6 Categories • 20+ Products**
+
+            **Full-Service AVL Production:**
+            LED Video Walls • Audio Systems • Lighting Design • Staging • Lasers • Special FX • Art Installations • Performers
+            """)
+        with col2:
+            st.markdown(f"""
+            **Resources:**
+            - [🧮 LED Calculator](https://p3avl.com/calculator)
+            - [📋 Services](https://p3avl.com/services)
+            - [ℹ️ About Us](https://p3avl.com/about)
+            - [📞 Contact](https://p3avl.com/contact)
+            - [🌐 Website]({SALES_WEBSITE})
+            """)
+
+    if not GOOGLE_MAPS_API_KEY:
+        st.warning("Add GOOGLE_MAPS_API_KEY to your .env file before generating leads from Google Places.")
+
+    with st.sidebar:
+        st.header("P³AVL Lead Machine")
+        st.caption("Zero Friction. Full Impact.")
+        
+        # Company logo/branding area
+        st.markdown("---")
+        st.markdown("**🏢 P³AVL Production Services**")
+        st.markdown("LED Walls • Audio • Lighting • Staging")
+        st.markdown(f"[🌐 {SALES_WEBSITE}]({SALES_WEBSITE})")
+        st.markdown("---")
+        
+        page = st.radio(
+            "Navigate",
+            [
+                "Generate Leads",
+                "Dashboard", 
+                "Lead Workbench",
+                "Follow-Up Queue",
+                "Manual Add",
+                "Settings",
+            ],
+        )
+
+        st.divider()
+        st.write("### Sales Targets")
+        st.write("Daily outbound goal: 50–100 calls")
+        st.write("Daily email/DM goal: 50–100")
+        st.write("Site-walk goal: 1–3/day")
+
+        st.divider()
+        st.write("### Compliance Reminder")
+        st.caption("Respect DNC lists, CAN-SPAM, TCPA, opt-outs, and platform rules. Do not use this for spam or automated robocalling.")
+
+    if page == "Generate Leads":
+        prospect_search_ui()
+    elif page == "Dashboard":
+        dashboard_ui()
+    elif page == "Lead Workbench":
+        lead_workbench_ui()
+    elif page == "Follow-Up Queue":
+        follow_up_ui()
+    elif page == "Manual Add":
+        manual_add_ui()
+    elif page == "Settings":
+        settings_ui()
+
+
+if __name__ == "__main__":
+    app()
